@@ -165,7 +165,7 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 				continue
 			}
 			// rebuild instance
-			completed, err := r.rebuildInstance(reqCtx, cli, opsRes, v.RestoreEnv, &progressDetail, instance, v.BackupName, i)
+			completed, err := r.rebuildInstance(reqCtx, cli, opsRes, &progressDetail, v, instance, i)
 			if intctrlutil.IsTargetError(err, intctrlutil.ErrorTypeFatal) {
 				// If a fatal error occurs, this instance rebuilds failed.
 				progressDetail.SetStatusAndMessage(appsv1alpha1.FailedProgressStatus, err.Error())
@@ -201,16 +201,21 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 func (r rebuildInstanceOpsHandler) rebuildInstance(reqCtx intctrlutil.RequestCtx,
 	cli client.Client,
 	opsRes *OpsResource,
-	envForRestore []corev1.EnvVar,
 	progressDetail *appsv1alpha1.ProgressStatusDetail,
+	rebuildFrom appsv1alpha1.RebuildInstance,
 	instance appsv1alpha1.Instance,
-	backupName string,
 	index int) (bool, error) {
-	insHelper, err := r.prepareInstanceHelper(reqCtx, cli, opsRes, envForRestore, instance, backupName, index)
+	insHelper, err := r.prepareInstanceHelper(reqCtx, cli, opsRes, rebuildFrom.RestoreEnv,
+		instance, rebuildFrom.BackupName, index)
 	if err != nil {
 		return false, err
 	}
-	if backupName == "" {
+
+	if !rebuildFrom.InPlace {
+		return r.rebuildInstanceWithHorizontalScaling(reqCtx, cli, opsRes, insHelper, progressDetail)
+	}
+
+	if rebuildFrom.BackupName == "" {
 		return r.rebuildInstanceWithNoBackup(reqCtx, cli, opsRes, insHelper, progressDetail)
 	}
 	return r.rebuildInstanceWithBackup(reqCtx, cli, opsRes, insHelper, progressDetail)
@@ -823,4 +828,12 @@ func (r rebuildInstanceOpsHandler) cleanupTmpResources(reqCtx intctrlutil.Reques
 	// TODO: need to delete the restore CR?
 	// Pods are limited in k8s, so we need to release them if they are not needed.
 	return intctrlutil.DeleteOwnedResources(reqCtx.Ctx, cli, opsRes.OpsRequest, matchLabels, generics.PodSignature)
+}
+
+func (r rebuildInstanceOpsHandler) rebuildInstanceWithHorizontalScaling(reqCtx intctrlutil.RequestCtx,
+	cli client.Client,
+	opsRes *OpsResource,
+	insHelper *instanceHelper,
+	progressDetail *appsv1alpha1.ProgressStatusDetail) (bool, error) {
+	return true, nil
 }

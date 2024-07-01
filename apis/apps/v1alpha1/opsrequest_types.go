@@ -244,6 +244,8 @@ type RebuildInstance struct {
 	// +kubebuilder:validation:Required
 	Instances []Instance `json:"instances"`
 
+	InPlace bool `json:"inPlace,omitempty"`
+
 	// Indicates the name of the Backup custom resource from which to recover the instance.
 	// Defaults to an empty PersistentVolume if unspecified.
 	//

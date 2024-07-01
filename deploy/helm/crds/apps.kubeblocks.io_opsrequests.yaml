@@ -3824,6 +3824,8 @@ spec:
                     componentName:
                       description: Specifies the name of the Component.
                       type: string
+                    inPlace:
+                      type: boolean
                     instances:
                       description: Specifies the instances (Pods) that need to be
                         rebuilt, typically operating as standbys.
