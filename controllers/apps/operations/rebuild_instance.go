@@ -21,28 +21,26 @@ package operations
 
 import (
 	"fmt"
-	"slices"
-	"strings"
+	"reflect"
 	"time"
 
+	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubectl/pkg/util/podutils"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/apecloud/kubeblocks/apis/apps/v1alpha1"
 	dpv1alpha1 "github.com/apecloud/kubeblocks/apis/dataprotection/v1alpha1"
 	"github.com/apecloud/kubeblocks/pkg/common"
 	"github.com/apecloud/kubeblocks/pkg/constant"
-	"github.com/apecloud/kubeblocks/pkg/controller/builder"
 	"github.com/apecloud/kubeblocks/pkg/controller/component"
 	"github.com/apecloud/kubeblocks/pkg/controller/factory"
+	"github.com/apecloud/kubeblocks/pkg/controller/instanceset"
 	intctrlutil "github.com/apecloud/kubeblocks/pkg/controllerutil"
 	dptypes "github.com/apecloud/kubeblocks/pkg/dataprotection/types"
 	dputils "github.com/apecloud/kubeblocks/pkg/dataprotection/utils"
 	"github.com/apecloud/kubeblocks/pkg/generics"
-	viper "github.com/apecloud/kubeblocks/pkg/viperx"
 )
 
 const (
@@ -55,22 +53,12 @@ const (
 	ignoreRoleCheckAnnotationKey = "kubeblocks.io/ignore-role-check"
 )
 
-type rebuildInstanceOpsHandler struct{}
-
-type instanceHelper struct {
-	targetPod *corev1.Pod
-	backup    *dpv1alpha1.Backup
-	instance  appsv1alpha1.Instance
-	actionSet *dpv1alpha1.ActionSet
-	// key: source pvc name, value: the tmp pvc which using to rebuild
-	pvcMap          map[string]*corev1.PersistentVolumeClaim
-	synthesizedComp *component.SynthesizedComponent
-	volumes         []corev1.Volume
-	volumeMounts    []corev1.VolumeMount
-	envForRestore   []corev1.EnvVar
-	rebuildPrefix   string
-	index           int
+type rebuildInstanceWrapper struct {
+	replicas int32
+	insNames []string
 }
+
+type rebuildInstanceOpsHandler struct{}
 
 var _ OpsHandler = rebuildInstanceOpsHandler{}
 
@@ -91,38 +79,86 @@ func (r rebuildInstanceOpsHandler) ActionStartedCondition(reqCtx intctrlutil.Req
 }
 
 func (r rebuildInstanceOpsHandler) Action(reqCtx intctrlutil.RequestCtx, cli client.Client, opsRes *OpsResource) error {
-	if opsRes.OpsRequest.Spec.Force {
-		return nil
-	}
 	for _, v := range opsRes.OpsRequest.Spec.RebuildFrom {
 		compStatus, ok := opsRes.Cluster.Status.Components[v.ComponentName]
 		if !ok {
 			continue
 		}
 		// check if the component has matched the `Phase` condition
-		if !slices.Contains([]appsv1alpha1.ClusterComponentPhase{appsv1alpha1.FailedClusterCompPhase,
+		if !opsRes.OpsRequest.Spec.Force && !slices.Contains([]appsv1alpha1.ClusterComponentPhase{appsv1alpha1.FailedClusterCompPhase,
 			appsv1alpha1.AbnormalClusterCompPhase, appsv1alpha1.UpdatingClusterCompPhase}, compStatus.Phase) {
 			return intctrlutil.NewFatalError(fmt.Sprintf(`the phase of component "%s" can not be %s`, v.ComponentName, compStatus.Phase))
 		}
+		var (
+			synthesizedComp *component.SynthesizedComponent
+			err             error
+		)
 		for _, ins := range v.Instances {
 			targetPod := &corev1.Pod{}
 			if err := cli.Get(reqCtx.Ctx, client.ObjectKey{Name: ins.Name, Namespace: opsRes.Cluster.Namespace}, targetPod); err != nil {
 				return err
 			}
-			synthesizedComp, err := r.buildSynthesizedComponent(reqCtx, cli, opsRes.Cluster, targetPod.Labels[constant.KBAppComponentLabelKey])
+			synthesizedComp, err = r.buildSynthesizedComponent(reqCtx, cli, opsRes.Cluster, targetPod.Labels[constant.KBAppComponentLabelKey])
 			if err != nil {
 				return err
 			}
-			isAvailable, _ := r.instanceIsAvailable(synthesizedComp, targetPod, "")
-			if isAvailable {
+			isAvailable, _ := instanceIsAvailable(synthesizedComp, targetPod, "")
+			if !opsRes.OpsRequest.Spec.Force && isAvailable {
 				return intctrlutil.NewFatalError(fmt.Sprintf(`instance "%s" is availabled, can not rebuild it`, ins.Name))
+			}
+		}
+		if !v.InPlace {
+			if synthesizedComp.Name != v.ComponentName {
+				return intctrlutil.NewFatalError("sharding cluster only supports to rebuild instance in place")
+			}
+			// validate when rebuilding instance with horizontal scaling
+			if err = r.validateRebuildInstanceWithHScale(reqCtx, cli, opsRes, synthesizedComp); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
+func (r rebuildInstanceOpsHandler) validateRebuildInstanceWithHScale(reqCtx intctrlutil.RequestCtx,
+	cli client.Client,
+	opsRes *OpsResource,
+	synthesizedComp *component.SynthesizedComponent) error {
+	// rebuild instance by horizontal scaling
+	pods, err := component.ListOwnedPods(reqCtx.Ctx, cli, opsRes.Cluster.Namespace, opsRes.Cluster.Name, synthesizedComp.Name)
+	if err != nil {
+		return err
+	}
+	for _, v := range pods {
+		available, _ := instanceIsAvailable(synthesizedComp, v, "")
+		if !available {
+			continue
+		}
+		if len(synthesizedComp.Roles) == 0 {
+			return nil
+		}
+		for _, role := range synthesizedComp.Roles {
+			// existing readWrite instance
+			if role.Writable && v.Labels[constant.RoleLabelKey] == role.Name {
+				return nil
+			}
+		}
+	}
+	return intctrlutil.NewFatalError("Due to insufficient available instances, horizontal scaling cannot be used for rebuilding instances." +
+		"but you can rebuild instances in place with backup by set 'inPlace' to 'true'.")
+}
+
 func (r rebuildInstanceOpsHandler) SaveLastConfiguration(reqCtx intctrlutil.RequestCtx, cli client.Client, opsRes *OpsResource) error {
+	compOpsHelper := newComponentOpsHelper(opsRes.OpsRequest.Spec.RebuildFrom)
+	getLastComponentInfo := func(compSpec appsv1alpha1.ClusterComponentSpec, comOps ComponentOpsInteface) appsv1alpha1.LastComponentConfiguration {
+		lastCompConfiguration := appsv1alpha1.LastComponentConfiguration{
+			Replicas:         pointer.Int32(compSpec.Replicas),
+			Instances:        compSpec.Instances,
+			OfflineInstances: compSpec.OfflineInstances,
+		}
+		return lastCompConfiguration
+	}
+	compOpsHelper.saveLastConfigurations(opsRes, getLastComponentInfo)
 	return nil
 }
 
@@ -144,47 +180,44 @@ func (r rebuildInstanceOpsHandler) getInstanceProgressDetail(compStatus appsv1al
 func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx, cli client.Client, opsRes *OpsResource) (appsv1alpha1.OpsPhase, time.Duration, error) {
 	var (
 		oldOpsRequest   = opsRes.OpsRequest.DeepCopy()
+		oldCluster      = opsRes.Cluster.DeepCopy()
 		opsRequestPhase = opsRes.OpsRequest.Status.Phase
 		expectCount     int
 		completedCount  int
 		failedCount     int
+		err             error
 	)
 	if opsRes.OpsRequest.Status.Components == nil {
 		opsRes.OpsRequest.Status.Components = map[string]appsv1alpha1.OpsRequestComponentStatus{}
 	}
 	for _, v := range opsRes.OpsRequest.Spec.RebuildFrom {
 		compStatus := opsRes.OpsRequest.Status.Components[v.ComponentName]
-		for i, instance := range v.Instances {
-			expectCount += 1
-			progressDetail := r.getInstanceProgressDetail(compStatus, instance.Name)
-			if isCompletedProgressStatus(progressDetail.Status) {
-				completedCount += 1
-				if progressDetail.Status == appsv1alpha1.FailedProgressStatus {
-					failedCount += 1
-				}
-				continue
-			}
-			// rebuild instance
-			completed, err := r.rebuildInstance(reqCtx, cli, opsRes, &progressDetail, v, instance, i)
-			if intctrlutil.IsTargetError(err, intctrlutil.ErrorTypeFatal) {
-				// If a fatal error occurs, this instance rebuilds failed.
-				progressDetail.SetStatusAndMessage(appsv1alpha1.FailedProgressStatus, err.Error())
-				setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
-				continue
-			}
-			if err != nil {
+		var (
+			subCompletedCount int
+			subFailedCount    int
+		)
+		if v.InPlace {
+			// rebuild instances in place.
+			if subCompletedCount, subFailedCount, err = r.rebuildInstancesInPlace(reqCtx, cli, opsRes, v, &compStatus); err != nil {
 				return opsRequestPhase, 0, err
 			}
-			if completed {
-				// if the pod has been rebuilt, set progressDetail phase to Succeed.
-				progressDetail.SetStatusAndMessage(appsv1alpha1.SucceedProgressStatus,
-					fmt.Sprintf("Rebuild pod %s successfully", instance.Name))
+		} else {
+			// rebuild instances with horizontal scaling
+			if subCompletedCount, subFailedCount, err = r.rebuildInstancesWithHScaling(reqCtx, cli, opsRes, v, &compStatus); err != nil {
+				return opsRequestPhase, 0, err
 			}
-			setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
 		}
+		expectCount += len(v.Instances)
+		completedCount += subCompletedCount
+		failedCount += subFailedCount
 		opsRes.OpsRequest.Status.Components[v.ComponentName] = compStatus
 	}
-	if err := syncProgressToOpsRequest(reqCtx, cli, opsRes, oldOpsRequest, completedCount, expectCount); err != nil {
+	if !reflect.DeepEqual(oldCluster.Spec, opsRes.Cluster.Spec) {
+		if err = cli.Update(reqCtx.Ctx, opsRes.Cluster); err != nil {
+			return opsRequestPhase, 0, err
+		}
+	}
+	if err = syncProgressToOpsRequest(reqCtx, cli, opsRes, oldOpsRequest, completedCount, expectCount); err != nil {
 		return opsRequestPhase, 0, err
 	}
 	// check if the ops has been finished.
@@ -197,6 +230,140 @@ func (r rebuildInstanceOpsHandler) ReconcileAction(reqCtx intctrlutil.RequestCtx
 	return appsv1alpha1.OpsFailedPhase, 0, nil
 }
 
+func (r rebuildInstanceOpsHandler) rebuildInstancesWithHScaling(reqCtx intctrlutil.RequestCtx,
+	cli client.Client,
+	opsRes *OpsResource,
+	rebuildInstance appsv1alpha1.RebuildInstance,
+	compStatus *appsv1alpha1.OpsRequestComponentStatus) (int, int, error) {
+	var (
+		completedCount int
+		failedCount    int
+	)
+	if len(compStatus.ProgressDetails) == 0 {
+		// 1. scale out the required instances
+		r.scaleOutRequiredInstances(opsRes, rebuildInstance, compStatus)
+		return 0, 0, nil
+	}
+	// 2. waiting for the necessary instances to complete the scaling-out process.
+
+	// 3. offline the instances that require rebuilding when the new pod scaling out successfully.
+	return 0, 0, nil
+}
+
+// getRebuildInstanceWrapper assembles the corresponding replicas and instances based on the template
+func (r rebuildInstanceOpsHandler) getRebuildInstanceWrapper(opsRes *OpsResource, rebuildInstance appsv1alpha1.RebuildInstance) map[string]*rebuildInstanceWrapper {
+	rebuildInsWrapper := map[string]*rebuildInstanceWrapper{}
+	for _, ins := range rebuildInstance.Instances {
+		insTplName := appsv1alpha1.GetInstanceTemplateName(opsRes.Cluster.Name, rebuildInstance.ComponentName, ins.Name)
+		if _, ok := rebuildInsWrapper[insTplName]; !ok {
+			rebuildInsWrapper[insTplName] = &rebuildInstanceWrapper{replicas: 1, insNames: []string{ins.Name}}
+		} else {
+			rebuildInsWrapper[insTplName].replicas += 1
+			rebuildInsWrapper[insTplName].insNames = append(rebuildInsWrapper[insTplName].insNames, ins.Name)
+		}
+	}
+	return rebuildInsWrapper
+}
+
+func (r rebuildInstanceOpsHandler) scaleOutRequiredInstances(opsRes *OpsResource,
+	rebuildInstance appsv1alpha1.RebuildInstance,
+	compStatus *appsv1alpha1.OpsRequestComponentStatus) {
+	// 1. sort the instances
+	slices.SortFunc(rebuildInstance.Instances, func(a, b appsv1alpha1.Instance) bool {
+		return a.Name < b.Name
+	})
+
+	// 2. assemble the corresponding replicas and instances based on the template
+	rebuildInsWrapper := r.getRebuildInstanceWrapper(opsRes, rebuildInstance)
+
+	// 3. update component spec to scale out required instances.
+	compName := rebuildInstance.ComponentName
+	lastCompConfiguration := opsRes.OpsRequest.Status.LastConfiguration.Components[compName]
+	scaleOutInsMap := map[string]string{}
+	setScaleOutInsMap := func(workloadName, templateName string,
+		replicas int32, offlineInstances []string, wrapper *rebuildInstanceWrapper) {
+		insNames := instanceset.GenerateInstanceNamesFromTemplate(workloadName, "", replicas, offlineInstances)
+		for i, insName := range wrapper.insNames {
+			scaleOutInsMap[insName] = insNames[int(replicas-wrapper.replicas)+i]
+		}
+	}
+	for i := range opsRes.Cluster.Spec.ComponentSpecs {
+		compSpec := &opsRes.Cluster.Spec.ComponentSpecs[i]
+		if compSpec.Name != compName {
+			continue
+		}
+		if *lastCompConfiguration.Replicas != compSpec.Replicas {
+			// means the componentSpec has been updated, ignore it.
+			continue
+		}
+		workloadName := constant.GenerateWorkloadNamePattern(opsRes.Cluster.Name, compName)
+		var allTemplateReplicas int32
+		for j := range compSpec.Instances {
+			insTpl := &compSpec.Instances[j]
+			if wrapper, ok := rebuildInsWrapper[insTpl.Name]; ok {
+				insTpl.Replicas = pointer.Int32(insTpl.GetReplicas() + wrapper.replicas)
+				setScaleOutInsMap(workloadName, insTpl.Name, *insTpl.Replicas, compSpec.OfflineInstances, wrapper)
+			}
+			allTemplateReplicas += insTpl.GetReplicas()
+		}
+		compSpec.Replicas += int32(len(rebuildInstance.Instances))
+		if wrapper, ok := rebuildInsWrapper[""]; ok {
+			setScaleOutInsMap(workloadName, "", compSpec.Replicas-allTemplateReplicas, compSpec.OfflineInstances, wrapper)
+		}
+		break
+	}
+	// 4. set progress details
+	for _, ins := range rebuildInstance.Instances {
+		scaleOutInsName := scaleOutInsMap[ins.Name]
+		setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails,
+			appsv1alpha1.ProgressStatusDetail{
+				ObjectKey: getProgressObjectKey(constant.PodKind, ins.Name),
+				Status:    appsv1alpha1.ProcessingProgressStatus,
+				Message:   fmt.Sprintf("Start to scale out a new pod %s", scaleOutInsName),
+			})
+	}
+}
+
+func (r rebuildInstanceOpsHandler) rebuildInstancesInPlace(reqCtx intctrlutil.RequestCtx,
+	cli client.Client,
+	opsRes *OpsResource,
+	rebuildInstance appsv1alpha1.RebuildInstance,
+	compStatus *appsv1alpha1.OpsRequestComponentStatus) (int, int, error) {
+	// rebuild instances in place.
+	var (
+		completedCount int
+		failedCount    int
+	)
+	for i, instance := range rebuildInstance.Instances {
+		progressDetail := r.getInstanceProgressDetail(*compStatus, instance.Name)
+		if isCompletedProgressStatus(progressDetail.Status) {
+			completedCount += 1
+			if progressDetail.Status == appsv1alpha1.FailedProgressStatus {
+				failedCount += 1
+			}
+			continue
+		}
+		// rebuild instance
+		completed, err := r.rebuildInstance(reqCtx, cli, opsRes, &progressDetail, rebuildInstance, instance, i)
+		if intctrlutil.IsTargetError(err, intctrlutil.ErrorTypeFatal) {
+			// If a fatal error occurs, this instance rebuilds failed.
+			progressDetail.SetStatusAndMessage(appsv1alpha1.FailedProgressStatus, err.Error())
+			setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
+			continue
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		if completed {
+			// if the pod has been rebuilt, set progressDetail phase to Succeed.
+			progressDetail.SetStatusAndMessage(appsv1alpha1.SucceedProgressStatus,
+				fmt.Sprintf("Rebuild pod %s successfully", instance.Name))
+		}
+		setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
+	}
+	return completedCount, failedCount, nil
+}
+
 // rebuildInstance rebuilds the instance.
 func (r rebuildInstanceOpsHandler) rebuildInstance(reqCtx intctrlutil.RequestCtx,
 	cli client.Client,
@@ -205,20 +372,16 @@ func (r rebuildInstanceOpsHandler) rebuildInstance(reqCtx intctrlutil.RequestCtx
 	rebuildFrom appsv1alpha1.RebuildInstance,
 	instance appsv1alpha1.Instance,
 	index int) (bool, error) {
-	insHelper, err := r.prepareInstanceHelper(reqCtx, cli, opsRes, rebuildFrom.RestoreEnv,
+	inPlaceHelper, err := r.prepareInplaceRebuildHelper(reqCtx, cli, opsRes, rebuildFrom.RestoreEnv,
 		instance, rebuildFrom.BackupName, index)
 	if err != nil {
 		return false, err
 	}
 
-	if !rebuildFrom.InPlace {
-		return r.rebuildInstanceWithHorizontalScaling(reqCtx, cli, opsRes, insHelper, progressDetail)
-	}
-
 	if rebuildFrom.BackupName == "" {
-		return r.rebuildInstanceWithNoBackup(reqCtx, cli, opsRes, insHelper, progressDetail)
+		return inPlaceHelper.rebuildInstanceWithNoBackup(reqCtx, cli, opsRes, progressDetail)
 	}
-	return r.rebuildInstanceWithBackup(reqCtx, cli, opsRes, insHelper, progressDetail)
+	return inPlaceHelper.rebuildInstanceWithBackup(reqCtx, cli, opsRes, progressDetail)
 }
 
 func (r rebuildInstanceOpsHandler) buildSynthesizedComponent(reqCtx intctrlutil.RequestCtx,
@@ -237,13 +400,13 @@ func (r rebuildInstanceOpsHandler) buildSynthesizedComponent(reqCtx intctrlutil.
 	return component.BuildSynthesizedComponent(reqCtx, cli, cluster, compDef, comp)
 }
 
-func (r rebuildInstanceOpsHandler) prepareInstanceHelper(reqCtx intctrlutil.RequestCtx,
+func (r rebuildInstanceOpsHandler) prepareInplaceRebuildHelper(reqCtx intctrlutil.RequestCtx,
 	cli client.Client,
 	opsRes *OpsResource,
 	envForRestore []corev1.EnvVar,
 	instance appsv1alpha1.Instance,
 	backupName string,
-	index int) (*instanceHelper, error) {
+	index int) (*inplaceRebuildHelper, error) {
 	var (
 		backup          *dpv1alpha1.Backup
 		actionSet       *dpv1alpha1.ActionSet
@@ -283,7 +446,7 @@ func (r rebuildInstanceOpsHandler) prepareInstanceHelper(reqCtx intctrlutil.Requ
 	if err != nil {
 		return nil, err
 	}
-	return &instanceHelper{
+	return &inplaceRebuildHelper{
 		index:           index,
 		backup:          backup,
 		instance:        instance,
@@ -296,125 +459,6 @@ func (r rebuildInstanceOpsHandler) prepareInstanceHelper(reqCtx intctrlutil.Requ
 		rebuildPrefix:   rebuildPrefix,
 		envForRestore:   envForRestore,
 	}, nil
-}
-
-// rebuildPodWithNoBackup rebuilds the instance with no backup.
-func (r rebuildInstanceOpsHandler) rebuildInstanceWithNoBackup(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRes *OpsResource,
-	insHelper *instanceHelper,
-	progressDetail *appsv1alpha1.ProgressStatusDetail) (bool, error) {
-	// 1. restore the new pvs.
-	completed, err := r.rebuildInstancePVByPod(reqCtx, cli, opsRes, insHelper, progressDetail)
-	if err != nil || !completed {
-		return false, err
-	}
-	if progressDetail.Message != waitingForInstanceReadyMessage {
-		// 2. rebuild source pvcs and recreate the instance by deleting it.
-		return false, r.rebuildSourcePVCsAndRecreateInstance(reqCtx, cli, opsRes.OpsRequest, progressDetail, insHelper)
-	}
-
-	// 3. waiting for new instance is available.
-	return r.instanceIsAvailable(insHelper.synthesizedComp, insHelper.targetPod, opsRes.OpsRequest.Annotations[ignoreRoleCheckAnnotationKey])
-}
-
-// rebuildPodWithBackup rebuild instance with backup.
-func (r rebuildInstanceOpsHandler) rebuildInstanceWithBackup(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRes *OpsResource,
-	insHelper *instanceHelper,
-	progressDetail *appsv1alpha1.ProgressStatusDetail) (bool, error) {
-
-	getRestore := func(stage dpv1alpha1.RestoreStage) (*dpv1alpha1.Restore, string, error) {
-		restoreName := fmt.Sprintf("%s-%s-%s-%s-%d", insHelper.rebuildPrefix, strings.ToLower(string(stage)),
-			common.CutString(opsRes.OpsRequest.Name, 10), insHelper.synthesizedComp.Name, insHelper.index)
-		restore := &dpv1alpha1.Restore{}
-		if err := cli.Get(reqCtx.Ctx, client.ObjectKey{Name: restoreName, Namespace: opsRes.Cluster.Namespace}, restore); err != nil {
-			return nil, restoreName, client.IgnoreNotFound(err)
-		}
-		return restore, restoreName, nil
-	}
-
-	waitRestoreCompleted := func(stage dpv1alpha1.RestoreStage) (bool, error) {
-		restore, restoreName, err := getRestore(stage)
-		if err != nil {
-			return false, nil
-		}
-		if restore == nil {
-			// create Restore CR
-			if stage == dpv1alpha1.PostReady {
-				//  waiting for the pod is available and do PostReady restore.
-				available, err := r.instanceIsAvailable(insHelper.synthesizedComp, insHelper.targetPod, opsRes.OpsRequest.Annotations[ignoreRoleCheckAnnotationKey])
-				if err != nil || !available {
-					return false, err
-				}
-				return false, r.createPostReadyRestore(reqCtx, cli, opsRes.OpsRequest, insHelper, restoreName)
-			}
-			return false, r.createPrepareDataRestore(reqCtx, cli, opsRes.OpsRequest, insHelper, restoreName)
-		}
-		if restore.Status.Phase == dpv1alpha1.RestorePhaseFailed {
-			return false, intctrlutil.NewFatalError(fmt.Sprintf(`pod "%s" rebuild failed, due to the Restore "%s" is Failed`, insHelper.targetPod.Name, restoreName))
-		}
-		if restore.Status.Phase != dpv1alpha1.RestorePhaseCompleted {
-			progressDetail.Message = fmt.Sprintf(`Waiting for %s Restore "%s" to be completed`, stage, restoreName)
-			return false, nil
-		}
-		return true, nil
-	}
-
-	var (
-		completed bool
-		err       error
-	)
-	// 1. restore the new instance pvs.
-	if insHelper.actionSet.HasPrepareDataStage() {
-		completed, err = waitRestoreCompleted(dpv1alpha1.PrepareData)
-	} else {
-		// if no prepareData stage, restore the pv by a tmp pod.
-		completed, err = r.rebuildInstancePVByPod(reqCtx, cli, opsRes, insHelper, progressDetail)
-	}
-	if err != nil || !completed {
-		return false, err
-	}
-	if progressDetail.Message != waitingForInstanceReadyMessage &&
-		!strings.HasPrefix(progressDetail.Message, waitingForPostReadyRestorePrefix) {
-		// 2. rebuild source pvcs and recreate the instance by deleting it.
-		return false, r.rebuildSourcePVCsAndRecreateInstance(reqCtx, cli, opsRes.OpsRequest, progressDetail, insHelper)
-	}
-	if insHelper.actionSet.HasPostReadyStage() {
-		// 3. do PostReady restore
-		return waitRestoreCompleted(dpv1alpha1.PostReady)
-	}
-	return r.instanceIsAvailable(insHelper.synthesizedComp, insHelper.targetPod, opsRes.OpsRequest.Annotations[ignoreRoleCheckAnnotationKey])
-}
-
-// rebuildInstancePVByPod rebuilds the new instance pvs by a temp pod.
-func (r rebuildInstanceOpsHandler) rebuildInstancePVByPod(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRes *OpsResource,
-	insHelper *instanceHelper,
-	progressDetail *appsv1alpha1.ProgressStatusDetail) (bool, error) {
-	rebuildPodName := fmt.Sprintf("%s-%s-%s-%d", insHelper.rebuildPrefix, common.CutString(opsRes.OpsRequest.Name, 20), insHelper.synthesizedComp.Name, insHelper.index)
-	rebuildPod := &corev1.Pod{}
-	exists, err := intctrlutil.CheckResourceExists(reqCtx.Ctx, cli, client.ObjectKey{Name: rebuildPodName, Namespace: opsRes.Cluster.Namespace}, rebuildPod)
-	if err != nil {
-		return false, err
-	}
-	if !exists {
-		return false, r.createTmpPVCsAndPod(reqCtx, cli, opsRes.OpsRequest, insHelper, rebuildPodName)
-	}
-	if rebuildPod.Status.Phase != corev1.PodSucceeded {
-		progressDetail.Message = fmt.Sprintf(`Waiting for rebuilding pod "%s" to be completed`, rebuildPod.Name)
-		return false, nil
-	}
-	return true, nil
-}
-
-func (r rebuildInstanceOpsHandler) getWellKnownLabels(synthesizedComp *component.SynthesizedComponent) map[string]string {
-	if synthesizedComp.CompDefName != "" {
-		return constant.GetKBWellKnownLabelsWithCompDef(synthesizedComp.CompDefName, synthesizedComp.ClusterName, synthesizedComp.Name)
-	}
-	return constant.GetKBWellKnownLabels(synthesizedComp.ClusterDefName, synthesizedComp.ClusterName, synthesizedComp.Name)
 }
 
 // getPVCMapAndVolumes gets the pvc map and the volume infos.
@@ -447,7 +491,7 @@ func (r rebuildInstanceOpsHandler) getPVCMapAndVolumes(opsRes *OpsResource,
 		if sourcePVCName == "" {
 			return nil, nil, nil, intctrlutil.NewFatalError("")
 		}
-		pvcLabels := r.getWellKnownLabels(synthesizedComp)
+		pvcLabels := getWellKnownLabels(synthesizedComp)
 		tmpPVC := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("%s-%s-%d", rebuildPrefix, common.CutString(synthesizedComp.Name+"-"+vct.Name, 30), index),
@@ -478,345 +522,6 @@ func (r rebuildInstanceOpsHandler) getPVCMapAndVolumes(opsRes *OpsResource,
 	return pvcMap, volumes, volumeMounts, nil
 }
 
-func (r rebuildInstanceOpsHandler) buildRestoreMetaObject(opsRequest *appsv1alpha1.OpsRequest, restoreName string) metav1.ObjectMeta {
-	return metav1.ObjectMeta{
-		Name:      restoreName,
-		Namespace: opsRequest.Namespace,
-		Labels: map[string]string{
-			constant.OpsRequestNameLabelKey:      opsRequest.Name,
-			constant.OpsRequestNamespaceLabelKey: opsRequest.Namespace,
-		},
-	}
-}
-
-// createPrepareDataRestore creates a Restore to rebuild new pvs with prepareData stage.
-func (r rebuildInstanceOpsHandler) createPrepareDataRestore(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRequest *appsv1alpha1.OpsRequest,
-	insHelper *instanceHelper,
-	restoreName string) error {
-	getVolumeMount := func(vctName string) string {
-		for i := range insHelper.volumeMounts {
-			if insHelper.volumeMounts[i].Name == vctName {
-				return insHelper.volumeMounts[i].MountPath
-			}
-		}
-		return ""
-	}
-	var volumeClaims []dpv1alpha1.RestoreVolumeClaim
-	for _, tmpPVC := range insHelper.pvcMap {
-		volumeClaim := dpv1alpha1.RestoreVolumeClaim{
-			ObjectMeta:      tmpPVC.ObjectMeta,
-			VolumeClaimSpec: tmpPVC.Spec,
-		}
-		vctName := tmpPVC.Labels[constant.VolumeClaimTemplateNameLabelKey]
-		if dputils.ExistTargetVolume(insHelper.backup.Status.BackupMethod.TargetVolumes, vctName) {
-			volumeClaim.VolumeSource = vctName
-		} else {
-			volumeClaim.MountPath = getVolumeMount(vctName)
-		}
-		volumeClaims = append(volumeClaims, volumeClaim)
-	}
-	schedulePolicy := dpv1alpha1.SchedulingSpec{
-		Tolerations:               insHelper.targetPod.Spec.Tolerations,
-		Affinity:                  insHelper.targetPod.Spec.Affinity,
-		TopologySpreadConstraints: insHelper.targetPod.Spec.TopologySpreadConstraints,
-	}
-	if insHelper.instance.TargetNodeName != "" {
-		schedulePolicy.NodeSelector = map[string]string{
-			corev1.LabelHostname: insHelper.instance.TargetNodeName,
-		}
-	}
-	restore := &dpv1alpha1.Restore{
-		ObjectMeta: r.buildRestoreMetaObject(opsRequest, restoreName),
-		Spec: dpv1alpha1.RestoreSpec{
-			Backup: dpv1alpha1.BackupRef{
-				Name:      insHelper.backup.Name,
-				Namespace: opsRequest.Namespace,
-			},
-			Env: insHelper.envForRestore,
-			PrepareDataConfig: &dpv1alpha1.PrepareDataConfig{
-				SchedulingSpec:           schedulePolicy,
-				VolumeClaimRestorePolicy: dpv1alpha1.VolumeClaimRestorePolicySerial,
-				RestoreVolumeClaims:      volumeClaims,
-			},
-		},
-	}
-	_ = intctrlutil.SetControllerReference(opsRequest, restore)
-	return client.IgnoreAlreadyExists(cli.Create(reqCtx.Ctx, restore))
-}
-
-// createPostReadyRestore creates a Restore to restore the data with postReady stage.
-func (r rebuildInstanceOpsHandler) createPostReadyRestore(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRequest *appsv1alpha1.OpsRequest,
-	insHelper *instanceHelper,
-	restoreName string) error {
-	labels := r.getWellKnownLabels(insHelper.synthesizedComp)
-	if insHelper.targetPod.Labels[constant.KBAppPodNameLabelKey] == insHelper.targetPod.Name {
-		labels[constant.KBAppPodNameLabelKey] = insHelper.targetPod.Name
-	}
-	podSelector := metav1.LabelSelector{
-		MatchLabels: labels,
-	}
-	// TODO: support to rebuild instance from backup when the PodSelectionStrategy of source target is All .
-	restore := &dpv1alpha1.Restore{
-		ObjectMeta: r.buildRestoreMetaObject(opsRequest, restoreName),
-		Spec: dpv1alpha1.RestoreSpec{
-			Backup: dpv1alpha1.BackupRef{
-				Name:      insHelper.backup.Name,
-				Namespace: insHelper.backup.Namespace,
-			},
-			Env: insHelper.envForRestore,
-			ReadyConfig: &dpv1alpha1.ReadyConfig{
-				ExecAction: &dpv1alpha1.ExecAction{
-					Target: dpv1alpha1.ExecActionTarget{PodSelector: podSelector},
-				},
-				JobAction: &dpv1alpha1.JobAction{
-					Target: dpv1alpha1.JobActionTarget{PodSelector: dpv1alpha1.PodSelector{
-						LabelSelector: &podSelector,
-						Strategy:      dpv1alpha1.PodSelectionStrategyAny,
-					}},
-				},
-			},
-		},
-	}
-	backupMethod := insHelper.backup.Status.BackupMethod
-	if backupMethod.TargetVolumes != nil {
-		restore.Spec.ReadyConfig.JobAction.Target.VolumeMounts = backupMethod.TargetVolumes.VolumeMounts
-	}
-	_ = intctrlutil.SetControllerReference(opsRequest, restore)
-	return client.IgnoreAlreadyExists(cli.Create(reqCtx.Ctx, restore))
-}
-
-// createTmpPVCsAndPod creates the tmp pvcs and pod.
-func (r rebuildInstanceOpsHandler) createTmpPVCsAndPod(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRequest *appsv1alpha1.OpsRequest,
-	insHelper *instanceHelper,
-	tmpPodName string) error {
-	for _, v := range insHelper.pvcMap {
-		_ = intctrlutil.SetControllerReference(opsRequest, v)
-		if err := cli.Create(reqCtx.Ctx, v); client.IgnoreAlreadyExists(err) != nil {
-			return err
-		}
-	}
-	container := &corev1.Container{
-		Name:            "rebuild",
-		Command:         []string{"sh", "-c", "echo 'rebuild done.'"},
-		ImagePullPolicy: corev1.PullPolicy(viper.GetString(constant.KBImagePullPolicy)),
-		Image:           viper.GetString(constant.KBToolsImage),
-		VolumeMounts:    insHelper.volumeMounts,
-	}
-	intctrlutil.InjectZeroResourcesLimitsIfEmpty(container)
-	rebuildPodBuilder := builder.NewPodBuilder(insHelper.targetPod.Namespace, tmpPodName).AddTolerations(insHelper.targetPod.Spec.Tolerations...).
-		AddContainer(*container).
-		AddVolumes(insHelper.volumes...).
-		SetRestartPolicy(corev1.RestartPolicyNever).
-		AddLabels(constant.OpsRequestNameLabelKey, opsRequest.Name).
-		AddLabels(constant.OpsRequestNamespaceLabelKey, opsRequest.Namespace).
-		SetTopologySpreadConstraints(insHelper.targetPod.Spec.TopologySpreadConstraints).
-		SetAffinity(insHelper.targetPod.Spec.Affinity)
-	if insHelper.instance.TargetNodeName != "" {
-		rebuildPodBuilder.SetNodeSelector(map[string]string{
-			corev1.LabelHostname: insHelper.instance.TargetNodeName,
-		})
-	}
-	rebuildPod := rebuildPodBuilder.GetObject()
-	_ = intctrlutil.SetControllerReference(opsRequest, rebuildPod)
-	return client.IgnoreAlreadyExists(cli.Create(reqCtx.Ctx, rebuildPod))
-}
-
-// rebuildSourcePVCsAndRecreateInstance rebuilds the source pvcs and recreate the instance by deleting it.
-func (r rebuildInstanceOpsHandler) rebuildSourcePVCsAndRecreateInstance(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRequest *appsv1alpha1.OpsRequest,
-	progressDetail *appsv1alpha1.ProgressStatusDetail,
-	insHelper *instanceHelper) error {
-	for sourcePVCName, v := range insHelper.pvcMap {
-		tmpPVC := &corev1.PersistentVolumeClaim{}
-		_ = cli.Get(reqCtx.Ctx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, tmpPVC)
-		if tmpPVC.UID == "" {
-			// if the tmp pvc not exists in k8s, replace with v.
-			tmpPVC = v
-		}
-		// 1. get the restored pv
-		pv, err := r.getRestoredPV(reqCtx, cli, tmpPVC)
-		if err != nil {
-			return err
-		}
-		if _, ok := pv.Annotations[rebuildFromAnnotation]; !ok {
-			if pv.Labels[rebuildTmpPVCNameLabel] != tmpPVC.Name {
-				// 2. retain and label the pv with 'rebuildTmpPVCNameLabel'
-				if err = r.retainAndLabelPV(reqCtx, cli, pv, tmpPVC); err != nil {
-					return err
-				}
-			}
-			// 3. cleanup the tmp pvc firstly.
-			if err = r.cleanupTmpPVC(reqCtx, cli, tmpPVC); err != nil {
-				return err
-			}
-			// 4. release the pv and annotate the pv with 'rebuildFromAnnotation'.
-			if err = r.releasePV(reqCtx, cli, pv, opsRequest.Name); err != nil {
-				return err
-			}
-		}
-		// set volumeName to tmp pvc, it will be used when recreating the source pvc.
-		tmpPVC.Spec.VolumeName = pv.Name
-		// 5. recreate the source pbc.
-		if err = r.recreateSourcePVC(reqCtx, cli, tmpPVC, sourcePVCName, opsRequest.Name); err != nil {
-			return err
-		}
-	}
-	// update progress message and recreate the target instance by deleting it.
-	progressDetail.Message = waitingForInstanceReadyMessage
-	var options []client.DeleteOption
-	if opsRequest.Spec.Force {
-		options = append(options, client.GracePeriodSeconds(0))
-	}
-	return intctrlutil.BackgroundDeleteObject(cli, reqCtx.Ctx, insHelper.targetPod, options...)
-}
-
-func (r rebuildInstanceOpsHandler) getRestoredPV(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	tmpPVC *corev1.PersistentVolumeClaim) (*corev1.PersistentVolume, error) {
-	pv := &corev1.PersistentVolume{}
-	volumeName := tmpPVC.Spec.VolumeName
-	if volumeName != "" {
-		if err := cli.Get(reqCtx.Ctx, types.NamespacedName{Name: volumeName}, pv); err != nil {
-			// We'll get called again later when the PV exists
-			return nil, err
-		}
-	} else {
-		pvList := &corev1.PersistentVolumeList{}
-		if err := cli.List(reqCtx.Ctx, pvList, client.MatchingLabels{rebuildTmpPVCNameLabel: tmpPVC.Name}, client.Limit(1)); err != nil {
-			return nil, err
-		}
-		if len(pvList.Items) == 0 {
-			return nil, intctrlutil.NewFatalError(fmt.Sprintf(`can not found the pv by the pvc "%s"`, tmpPVC.Name))
-		}
-		pv = &pvList.Items[0]
-	}
-	return pv, nil
-}
-
-func (r rebuildInstanceOpsHandler) retainAndLabelPV(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	pv *corev1.PersistentVolume,
-	tmpPVC *corev1.PersistentVolumeClaim) error {
-	patchPV := client.MergeFrom(pv.DeepCopy())
-	// Examine the claimRef for the PV and see if it's bound to the correct PVC
-	claimRef := pv.Spec.ClaimRef
-	if claimRef != nil && claimRef.Name != tmpPVC.Name || claimRef.Namespace != tmpPVC.Namespace {
-		return intctrlutil.NewFatalError(fmt.Sprintf(`the pv "%s" is not bound by the pvc "%s"`, pv.Name, tmpPVC.Name))
-	}
-	// 1. retain and label the pv
-	pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
-	if pv.Labels == nil {
-		pv.Labels = map[string]string{}
-	}
-	// record the tmp pvc name to the pv labels. used for idempotent reentry if occurs error.
-	pv.Labels[rebuildTmpPVCNameLabel] = tmpPVC.Name
-	return cli.Patch(reqCtx.Ctx, pv, patchPV)
-}
-
-func (r rebuildInstanceOpsHandler) cleanupTmpPVC(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	tmpPVC *corev1.PersistentVolumeClaim) error {
-	// if the tmp pvc exists, delete it.
-	if err := intctrlutil.BackgroundDeleteObject(cli, reqCtx.Ctx, tmpPVC); err != nil {
-		return err
-	}
-	return r.removePVCFinalizer(reqCtx, cli, tmpPVC)
-}
-
-func (r rebuildInstanceOpsHandler) recreateSourcePVC(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	tmpPVC *corev1.PersistentVolumeClaim,
-	sourcePVCName,
-	opsRequestName string) error {
-	sourcePvc := &corev1.PersistentVolumeClaim{}
-	if err := cli.Get(reqCtx.Ctx, types.NamespacedName{Name: sourcePVCName, Namespace: tmpPVC.Namespace}, sourcePvc); err != nil {
-		// if not exists, wait for the pvc to recreate by external controller.
-		return err
-	}
-	// if the pvc is rebuilt by current opsRequest, return.
-	if sourcePvc.Annotations[rebuildFromAnnotation] == opsRequestName {
-		return nil
-	}
-	// 1. retain labels of the source pvc.
-	intctrlutil.MergeMetadataMapInplace(sourcePvc.Labels, &tmpPVC.Labels)
-	// 2. delete the old pvc
-	if err := intctrlutil.BackgroundDeleteObject(cli, reqCtx.Ctx, sourcePvc); err != nil {
-		return err
-	}
-	if err := r.removePVCFinalizer(reqCtx, cli, sourcePvc); err != nil {
-		return err
-	}
-
-	// 3. recreate the pvc with restored PV.
-	newPVC := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sourcePVCName,
-			Namespace: tmpPVC.Namespace,
-			Labels:    tmpPVC.Labels,
-			Annotations: map[string]string{
-				rebuildFromAnnotation: opsRequestName,
-			},
-		},
-		Spec: tmpPVC.Spec,
-	}
-	return cli.Create(reqCtx.Ctx, newPVC)
-}
-
-// releasePV releases the persistentVolume by resetting `claimRef`.
-func (r rebuildInstanceOpsHandler) releasePV(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	pv *corev1.PersistentVolume,
-	opsRequestName string) error {
-	patchPV := client.MergeFrom(pv.DeepCopy())
-	pv.Spec.ClaimRef = nil
-	if pv.Annotations == nil {
-		pv.Annotations = map[string]string{}
-	}
-	pv.Annotations[rebuildFromAnnotation] = opsRequestName
-	return cli.Patch(reqCtx.Ctx, pv, patchPV)
-}
-
-func (r rebuildInstanceOpsHandler) removePVCFinalizer(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	pvc *corev1.PersistentVolumeClaim) error {
-	patch := client.MergeFrom(pvc.DeepCopy())
-	pvc.Finalizers = nil
-	return client.IgnoreNotFound(cli.Patch(reqCtx.Ctx, pvc, patch))
-}
-
-// instanceIsAvailable checks if the instance is available.
-func (r rebuildInstanceOpsHandler) instanceIsAvailable(
-	synthesizedComp *component.SynthesizedComponent,
-	targetPod *corev1.Pod,
-	ignoreRoleCheckAnnotation string) (bool, error) {
-	if !targetPod.DeletionTimestamp.IsZero() {
-		return false, nil
-	}
-	isFailed, isTimeout, _ := intctrlutil.IsPodFailedAndTimedOut(targetPod)
-	if isFailed && isTimeout {
-		return false, intctrlutil.NewFatalError(fmt.Sprintf(`the new instance "%s" is failed, please check it`, targetPod.Name))
-	}
-	if !podutils.IsPodAvailable(targetPod, synthesizedComp.MinReadySeconds, metav1.Now()) {
-		return false, nil
-	}
-	// If roleProbe is not defined, return true.
-	if len(synthesizedComp.Roles) == 0 || ignoreRoleCheckAnnotation == "true" {
-		return true, nil
-	}
-	// check if the role detection is successfully.
-	if _, ok := targetPod.Labels[constant.RoleLabelKey]; ok {
-		return true, nil
-	}
-	return false, nil
-}
-
 // cleanupTmpResources clean up the temporary resources generated during the process of rebuilding the instance.
 func (r rebuildInstanceOpsHandler) cleanupTmpResources(reqCtx intctrlutil.RequestCtx,
 	cli client.Client,
@@ -828,12 +533,4 @@ func (r rebuildInstanceOpsHandler) cleanupTmpResources(reqCtx intctrlutil.Reques
 	// TODO: need to delete the restore CR?
 	// Pods are limited in k8s, so we need to release them if they are not needed.
 	return intctrlutil.DeleteOwnedResources(reqCtx.Ctx, cli, opsRes.OpsRequest, matchLabels, generics.PodSignature)
-}
-
-func (r rebuildInstanceOpsHandler) rebuildInstanceWithHorizontalScaling(reqCtx intctrlutil.RequestCtx,
-	cli client.Client,
-	opsRes *OpsResource,
-	insHelper *instanceHelper,
-	progressDetail *appsv1alpha1.ProgressStatusDetail) (bool, error) {
-	return true, nil
 }

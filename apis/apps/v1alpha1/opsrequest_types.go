@@ -279,7 +279,7 @@ type Instance struct {
 	Name string `json:"name"`
 
 	// The instance will rebuild on the specified node when the instance uses local PersistentVolume as the storage disk.
-	// If not set, it will rebuild on a random node.
+	// If not set, it will rebuild on a random node. Note it becomes effective when "inPlace" is set to true.
 	// +optional
 	TargetNodeName string `json:"targetNodeName,omitempty"`
 }
