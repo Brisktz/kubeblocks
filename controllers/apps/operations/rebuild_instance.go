@@ -22,10 +22,12 @@ package operations
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,15 +45,7 @@ import (
 	"github.com/apecloud/kubeblocks/pkg/generics"
 )
 
-const (
-	rebuildFromAnnotation  = "apps.kubeblocks.io/rebuild-from"
-	rebuildTmpPVCNameLabel = "apps.kubeblocks.io/rebuild-tmp-pvc"
-
-	waitingForInstanceReadyMessage   = "Waiting for the rebuilding instance to be ready"
-	waitingForPostReadyRestorePrefix = "Waiting for postReady Restore"
-
-	ignoreRoleCheckAnnotationKey = "kubeblocks.io/ignore-role-check"
-)
+const scalingOutPodPrefixMsg = "Scaling out a new pod"
 
 type rebuildInstanceWrapper struct {
 	replicas int32
@@ -244,10 +238,83 @@ func (r rebuildInstanceOpsHandler) rebuildInstancesWithHScaling(reqCtx intctrlut
 		r.scaleOutRequiredInstances(opsRes, rebuildInstance, compStatus)
 		return 0, 0, nil
 	}
+
 	// 2. waiting for the necessary instances to complete the scaling-out process.
+	synthesizedComp, err := r.buildSynthesizedComponent(reqCtx, cli, opsRes.Cluster, rebuildInstance.ComponentName)
+	if err != nil {
+		return 0, 0, err
+	}
+	var instancesNeedToOffline []string
+	compSpec := opsRes.Cluster.Spec.GetComponentByName(rebuildInstance.ComponentName)
+	for _, instance := range rebuildInstance.Instances {
+		progressDetail := r.getInstanceProgressDetail(*compStatus, instance.Name)
+		scalingOutPodName := r.getScalingOutPodNameFromMessage(progressDetail.Message)
+		pod := &corev1.Pod{}
+		if err = cli.Get(reqCtx.Ctx, client.ObjectKey{Name: scalingOutPodName, Namespace: opsRes.Cluster.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return 0, 0, err
+		}
+		isAvailable, err := instanceIsAvailable(synthesizedComp, pod, opsRes.OpsRequest.Annotations[ignoreRoleCheckAnnotationKey])
+		if err != nil {
+			// set progress status to failed when new pod is failed
+			failedCount += 1
+			completedCount += 1
+			progressDetail.SetStatusAndMessage(appsv1alpha1.FailedProgressStatus,
+				r.buildScalingOutPodMessage(scalingOutPodName, string(appsv1alpha1.UnavailablePhase)))
+			setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
+			continue
+		}
+		if !isAvailable {
+			// wait for the pod to available
+			continue
+		}
+		if slices.Contains(compSpec.OfflineInstances, instance.Name) {
+			// delete the pod that needs to rebuild
+			pod = &corev1.Pod{}
+			if err = cli.Get(reqCtx.Ctx, client.ObjectKey{Name: instance.Name, Namespace: opsRes.Cluster.Namespace}, pod); err != nil {
+				if apierrors.IsNotFound(err) {
+					// if the pod that needs to rebuild is not found and new pod is available, means rebuild completed.
+					completedCount += 1
+					progressDetail.SetStatusAndMessage(appsv1alpha1.ProcessingProgressStatus,
+						r.buildScalingOutPodMessage(scalingOutPodName, string(appsv1alpha1.AvailablePhase)))
+					setComponentStatusProgressDetail(opsRes.Recorder, opsRes.OpsRequest, &compStatus.ProgressDetails, progressDetail)
+					continue
+				}
+				return 0, 0, err
+			} else if !pod.DeletionTimestamp.IsZero() && opsRes.OpsRequest.Force() {
+				_ = intctrlutil.BackgroundDeleteObject(cli, reqCtx.Ctx, pod, client.GracePeriodSeconds(0))
+			}
+		} else {
+			instancesNeedToOffline = append(instancesNeedToOffline, instance.Name)
+		}
+	}
 
 	// 3. offline the instances that require rebuilding when the new pod scaling out successfully.
-	return 0, 0, nil
+	if len(instancesNeedToOffline) > 0 {
+		for i := range opsRes.Cluster.Spec.ComponentSpecs {
+			compSpec = &opsRes.Cluster.Spec.ComponentSpecs[i]
+			if compSpec.Name != rebuildInstance.ComponentName {
+				continue
+			}
+			for _, insName := range instancesNeedToOffline {
+				compSpec.OfflineInstances = append(compSpec.OfflineInstances, insName)
+				templateName := appsv1alpha1.GetInstanceTemplateName(opsRes.Cluster.Name, rebuildInstance.ComponentName, insName)
+				if templateName == "" {
+					continue
+				}
+				for j := range compSpec.Instances {
+					instanceTpl := &compSpec.Instances[j]
+					if instanceTpl.Name == templateName {
+						instanceTpl.Replicas = pointer.Int32(instanceTpl.GetReplicas() - 1)
+					}
+				}
+			}
+			compSpec.Replicas -= int32(len(instancesNeedToOffline))
+		}
+	}
+	return completedCount, failedCount, nil
 }
 
 // getRebuildInstanceWrapper assembles the corresponding replicas and instances based on the template
@@ -319,9 +386,21 @@ func (r rebuildInstanceOpsHandler) scaleOutRequiredInstances(opsRes *OpsResource
 			appsv1alpha1.ProgressStatusDetail{
 				ObjectKey: getProgressObjectKey(constant.PodKind, ins.Name),
 				Status:    appsv1alpha1.ProcessingProgressStatus,
-				Message:   fmt.Sprintf("Start to scale out a new pod %s", scaleOutInsName),
+				Message:   r.buildScalingOutPodMessage(scaleOutInsName, "Processing"),
 			})
 	}
+}
+
+func (r rebuildInstanceOpsHandler) buildScalingOutPodMessage(scaleOutPodName string, status string) string {
+	return fmt.Sprintf("%s: %s, status: %s", scalingOutPodPrefixMsg, scaleOutPodName, status)
+}
+
+func (r rebuildInstanceOpsHandler) getScalingOutPodNameFromMessage(progressMsg string) string {
+	if !strings.HasPrefix(progressMsg, scalingOutPodPrefixMsg) {
+		return ""
+	}
+	strArr := strings.Split(progressMsg, ",")
+	return strings.Replace(strArr[0], scalingOutPodPrefixMsg+": ", "", 1)
 }
 
 func (r rebuildInstanceOpsHandler) rebuildInstancesInPlace(reqCtx intctrlutil.RequestCtx,

@@ -40,6 +40,16 @@ import (
 	viper "github.com/apecloud/kubeblocks/pkg/viperx"
 )
 
+const (
+	rebuildFromAnnotation  = "apps.kubeblocks.io/rebuild-from"
+	rebuildTmpPVCNameLabel = "apps.kubeblocks.io/rebuild-tmp-pvc"
+
+	waitingForInstanceReadyMessage   = "Waiting for the rebuilding instance to be ready"
+	waitingForPostReadyRestorePrefix = "Waiting for postReady Restore"
+
+	ignoreRoleCheckAnnotationKey = "kubeblocks.io/ignore-role-check"
+)
+
 type inplaceRebuildHelper struct {
 	targetPod *corev1.Pod
 	backup    *dpv1alpha1.Backup
